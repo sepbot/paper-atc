@@ -1,0 +1,365 @@
+'use strict';
+
+window.addEventListener('DOMContentLoaded', async function() {
+  const network = new NetworkManager('ws://127.0.0.1:8989/a');
+  const engine = new PaperEngine(document.getElementById('app'), network);
+  await engine.start();
+});
+
+class PaperEngine {
+  constructor(canvas, network) {
+    this._canvas = canvas;
+    this._network = network;
+  }
+
+  async start() {
+    const instance = this;
+    const engine = new BABYLON.Engine(instance._canvas, true);
+    function resizeEngine() {
+      engine.setSize(window.innerWidth, window.innerHeight);
+    }
+    window.addEventListener('resize', resizeEngine);
+
+    const scene = new BABYLON.Scene(engine);
+    scene.clearColor = new BABYLON.Color4(0.30, 0.30, 0.30, 1);
+    await PaperEngine._loadAssets(scene);
+
+    // TODO: Replace with better camera
+    const camera = new BABYLON.FreeCamera('main', new BABYLON.Vector3(50, 40, 50), scene);
+    const input = new TouchNavigationCameraInput();
+    camera.inputs.clear();
+    camera.inputs.add(input);
+    camera.cameraDirection = new BABYLON.Vector3(-5,0,-5);
+    camera.attachControl(this._canvas, true);
+
+    const light = new BABYLON.HemisphericLight('light', new BABYLON.Vector3(0,2,0), scene);
+    light.specular = new BABYLON.Color3(0.1, 0.1, 0.1);
+
+    const ground = BABYLON.MeshBuilder.CreateGround('ground', {width: 50, height: 50, subdivisions: 1}, scene);
+    ground.position = new BABYLON.Vector3(25, 0, 25);
+    const groundMaterial = new BABYLON.StandardMaterial('groundMaterial', scene);
+    groundMaterial.diffuseColor = new BABYLON.Color3(0.25, 0.25, 0.25);
+    ground.material = groundMaterial;
+
+    const renderLoopTasks = [];
+    function addRenderLoopTask(task) {
+      renderLoopTasks.push(task);
+    }
+    function getFramesPerSecondRate() {
+      return engine.getFps();
+    }
+
+    const hud = new HeadsUpDisplay({
+      addRenderLoopTask: addRenderLoopTask,
+      getFramesPerSecondRate: getFramesPerSecondRate,
+      scene: scene,
+      input: input
+    });
+    hud.start();
+
+    function renderLoop() {
+      renderLoopTasks.forEach((cb) => { cb() });
+      scene.render();
+    }
+
+    engine.runRenderLoop(renderLoop);
+  }
+
+  static async _loadAssets(scene) {
+    return new Promise(function (resolve, reject) {
+      const meshes = {};
+      const manager = new BABYLON.AssetsManager(scene);
+      const task = manager.addMeshTask('paperAirplane', '', 'assets/', 'paper_airplane.babylon');
+      task.onError = reject;
+      task.onSuccess = function (task) {
+        meshes.paperAirplane = task['loadedMeshes'][0];
+      };
+      manager.onFinish = function () {
+        resolve(meshes);
+      };
+      manager.load();
+    });
+  }
+
+}
+
+class HeadsUpDisplay {
+  constructor(engine) {
+    this._engine = engine;
+  }
+
+  start() {
+    const instance = this;
+    const fontSize = 10;
+    const lineHeight = 14;
+    const precision = 4;
+
+    const hud = BABYLON.GUI.AdvancedDynamicTexture.CreateFullscreenUI('HUD');
+
+    const fps = new BABYLON.GUI.TextBlock('fps', '0 FPS');
+    fps.textHorizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_RIGHT;
+    fps.textVerticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+    fps.fontSize = 10;
+    function updateFps() {
+      fps.text = `${Math.floor(instance._engine.getFramesPerSecondRate())} FPS`;
+    }
+    setInterval(updateFps, 1000);
+    hud.addControl(fps);
+
+    const debugStackContainer = new BABYLON.GUI.Rectangle();
+    debugStackContainer.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+    debugStackContainer.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+    debugStackContainer.width = 0.5;
+    debugStackContainer.thickness = 0;
+    hud.addControl(debugStackContainer);
+    const debugStack = new BABYLON.GUI.StackPanel();
+    debugStack.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+    debugStackContainer.addControl(debugStack);
+
+    function addDebugInfoToStack(name) {
+      const text = new BABYLON.GUI.TextBlock(`Debug${name}`, name);
+      text.fontSize = fontSize;
+      text.height = `${lineHeight}px`;
+      text.textHorizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+      debugStack.addControl(text);
+      return text;
+    }
+
+    const cameraDebug = addDebugInfoToStack('Camera');
+    function updateCameraDebugInfo() {
+      const activeCamera = instance._engine.scene.activeCamera;
+      const debugInformation = [];
+      if (activeCamera.position !== undefined) {
+        const x = activeCamera.position.x.toPrecision(precision);
+        const y = activeCamera.position.y.toPrecision(precision);
+        const z = activeCamera.position.z.toPrecision(precision);
+        debugInformation.push(`Camera Position | x:${x} y:${y} z:${z}`);
+      }
+      if (activeCamera.rotation !== undefined) {
+        const x = activeCamera.rotation.x.toPrecision(precision);
+        const y = activeCamera.rotation.y.toPrecision(precision);
+        debugInformation.push(`Camera Rotation | x:${x} y:${y}`);
+      }
+      cameraDebug.height = `${debugInformation.length * lineHeight}px`;
+      cameraDebug.text = debugInformation.join('\n');
+    }
+    instance._engine.addRenderLoopTask(updateCameraDebugInfo);
+
+    const inputDebug = addDebugInfoToStack('Input');
+    function updateInputDebugInfo(info) {
+      const debugInformation = [];
+      info.forEach((i) => {
+        debugInformation.push(`Input Pointer ${i.name} | id: ${i.id} x:${i.x} y:${i.y}`);
+      });
+      inputDebug.height = `${debugInformation.length * lineHeight}px`;
+      inputDebug.text = debugInformation.join('\n');
+    }
+    instance._engine.input.registerEventListener(updateInputDebugInfo);
+
+    const networkDebug = addDebugInfoToStack('Network');
+
+    // TODO: Might be a bug, one would think it will auto resize.
+    function fixDebugStackHeight() {
+      const height = parseInt(cameraDebug.height) + parseInt(inputDebug.height) + parseInt(networkDebug.height);
+      debugStack.height = `${height}px`;
+    }
+    instance._engine.addRenderLoopTask(fixDebugStackHeight);
+
+  }
+}
+
+class TouchNavigationCameraInput {
+  constructor() {
+    this._listeners = [];
+    this.camera = {};
+  }
+
+  registerEventListener(listener) {
+    this._listeners.push(listener);
+  }
+
+  // noinspection JSMethodCanBeStatic
+  getTypeName() {
+    return 'TouchNavigationCameraInput';
+  }
+
+  // noinspection JSMethodCanBeStatic
+  getSimpleName() {
+    return 'touchNav';
+  }
+
+  attachControl(element, noPreventDefault) {
+    const instance = this;
+    let a, b, previous;
+    function resetState() {
+      a = undefined;
+      b = undefined;
+      previous = undefined;
+    }
+    function pointerObservable(info, state) {
+      const event = info.event;
+      event.preventDefault();
+      if (event['pointerType'] !== 'touch') {
+        // Only interested in touch events.
+        return;
+      }
+      const pointer = {
+        x: event['clientX'],
+        y: event['clientY'],
+        id: event['pointerId']
+      };
+      switch (info.type) {
+        case BABYLON.PointerEventTypes.POINTERDOWN:
+          try {
+            event.srcElement.setPointerCapture(pointer.id);
+          } catch (e) {
+            // The show must go on.
+          }
+          if (a === undefined) {
+            a = pointer;
+          } else if (b === undefined) {
+            b = pointer;
+          }
+          element.focus();
+          break;
+        case BABYLON.PointerEventTypes.POINTERUP:
+          try {
+            event.srcElement.releasePointerCapture(pointer.id);
+          } catch (e) {
+            // Nothing to do
+          }
+          resetState();
+          break;
+        case BABYLON.PointerEventTypes.POINTERMOVE:
+          if (a !== undefined && b === undefined) {
+            // Single input, look around
+            const x = pointer.x - a.x;
+            const y = pointer.y - a.y;
+            instance.camera.cameraRotation.y += x / 2000;
+            instance.camera.cameraRotation.x += y / 2000;
+          } else if (a !== undefined && b !== undefined) {
+            // Dual input, move backwards and forward
+            const pinch = Math.sqrt(Math.pow(a.x - b.x, 2) + Math.pow(a.y - b.y, 2));
+            if (previous === undefined || pinch === 0) {
+              previous = pinch;
+              return
+            }
+            if (pinch !== previous) {
+              const delta = (previous - pinch) / 2;
+              instance.camera.position = instance.camera.getFrontPosition(delta);
+              console.log(`${instance.camera.position} ${delta}`);
+              previous = pinch;
+            }
+          }
+          if (a && a.id === pointer.id) {
+            a = pointer;
+          } else if (b && b.id === pointer.id) {
+            b = pointer;
+          }
+          break;
+      }
+      const inputs = [ {name: 'A', ...a}, {name: 'B', ...b} ];
+      instance._listeners.forEach((listener) => {
+        listener(inputs);
+      });
+    }
+
+    const eventMask = BABYLON.PointerEventTypes.POINTERDOWN |
+                      BABYLON.PointerEventTypes.POINTERUP |
+                      BABYLON.PointerEventTypes.POINTERMOVE;
+    this.camera.getScene().onPointerObservable.add(pointerObservable, eventMask);
+    BABYLON.Tools.RegisterTopRootEvents([
+      { name: 'blur', handler: resetState }
+    ]);
+
+    function contextMenuEvent(event) {
+      event.preventDefault();
+    }
+    element.addEventListener('contextmenu', contextMenuEvent, true)
+  }
+
+  detachControl(element) {
+    console.log(this.camera);
+  }
+}
+
+class NetworkManager {
+  constructor(url) {
+    this._url = url;
+    this._openListeners = [];
+    this._closeListeners = [];
+    this._messageListeners = {};
+  }
+
+  start() {
+    const instance = this;
+    const socket = new WebSocket(this._url);
+    const respondWithError = function (message, e) {
+      const errorMessage = { type: 'error' };
+      if (message !== undefined) {
+        errorMessage.message = message;
+      }
+      if (e !== undefined && e instanceof Error) {
+        errorMessage.error = e.message;
+      }
+      const errorMessageString = JSON.stringify(errorMessage);
+      socket.send(errorMessageString);
+      console.log(`Error: ${errorMessageString}`);
+    };
+    const closeHandler = function () {
+      instance._closeListeners.forEach((listener) => {
+        listener();
+      });
+      if (instance._retry === undefined) {
+        instance._retry = setInterval(instance.start.bind(instance), 10000);
+      }
+    };
+    const openHandler = function () {
+      instance._openListeners.forEach((listener) => {
+        listener();
+      });
+      if (instance._retry !== undefined) {
+        clearInterval(instance._retry);
+      }
+    };
+    const messageHandler = function (event) {
+      try {
+        const message = JSON.parse(event);
+        if (message.type === undefined) {
+          respondWithError('Request did not contain type property.');
+          return;
+        }
+        const listeners = instance._messageListeners[message.type];
+        if (listeners !== undefined && listeners.length !== 0) {
+          listeners.forEach((listener) => {
+            listener(message);
+          });
+        } else {
+          console.log(`no listeners for message type ${message.type}`);
+        }
+      } catch (e) {
+        respondWithError('Failed to process last message', e);
+      }
+    };
+    socket.onclose = closeHandler;
+    socket.onerror = closeHandler;
+    socket.onopen = openHandler;
+    socket.onmessage = messageHandler;
+  }
+
+  registerOpenListener(listener) {
+    this._openListeners.push(listener);
+  }
+
+  registerCloseListener(listener) {
+    this._closeListeners.push(listener);
+  }
+
+  registerMessageListener(type, listener) {
+    if (this._messageListeners[type] === undefined) {
+      this._messageListeners[type] = [];
+    }
+    this._messageListeners[type].push(listener);
+  }
+
+}
